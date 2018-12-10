@@ -39,7 +39,7 @@ tf.app.flags.DEFINE_string('ps_hosts', 'localhost:2221',
 # 两个worker节点
 tf.app.flags.DEFINE_string('worker_hosts', 'localhost:2222,localhost:2223',
                     'Comma-separated list of hostname:port pairs')
-# 每台机器的 GPU 个数，这里单机上运行，因此为 0
+# 每台机器的 GPU 个数
 tf.app.flags.DEFINE_integer("num_gpus", 0, "Total number of gpus for each machine."
                                            "If you don't use GPU, please set it to '0'")
 
@@ -48,20 +48,6 @@ tf.app.flags.DEFINE_integer("num_gpus", 0, "Total number of gpus for each machin
 tf.app.flags.DEFINE_string('job_name', None, 'job name: worker or ps')
 # 设置任务的索引
 tf.app.flags.DEFINE_integer('task_index', None, 'Index of task within the job')
-# 选择异步并行，同步并行
-tf.app.flags.DEFINE_bool('sync_replicas', True, 'Whether or not to synchronize the replicas during training.')
-# 如果服务器已经存在，采用 gRPC 协议通信;如果不存在，采用进程间通信
-tf.app.flags.DEFINE_boolean(
-    "existing_servers", False, "Whether servers already exists. If True, "
-                               "will use the worker hosts via their GRPC URLs (one client process "
-                               "per worker host). Otherwise, will create an in-process TensorFlow "
-                               "server.")
-
-# 在同步训练模式下，设置收集的工作节点的数量。默认就是工作节点的总数
-tf.app.flags.DEFINE_integer("replicas_to_aggregate", None,
-                            "Number of replicas to aggregate before parameter update "
-                            "is applied (For sync_replicas mode only; default: "
-                            "num_workers)")
 
 # Global constants describing the CIFAR-10 data set.
 IMAGE_SIZE = cifar10_input.IMAGE_SIZE
@@ -87,6 +73,7 @@ def train():
     else:
         print('task_index : %d' % FLAGS.task_index)
 
+    # 机器参数解析
     ps_spc = FLAGS.ps_hosts.split(',')
     worker_spec = FLAGS.worker_hosts.split(',')
 
@@ -94,17 +81,24 @@ def train():
     num_workers = len(worker_spec)
     print("worker numbers:%d"%num_workers)
     # 创建集群
-    cluster = tf.train.ClusterSpec({'ps': ps_spc, 'worker': worker_spec})
+    cluster = tf.train.ClusterSpec({'ps': ps_spc,
+                                    'worker': worker_spec})
 
     # 创建当前机器的server，用以连接到cluster
     # 这里flag通过接收终端输入的job_name和task_index来指定对应的设备
     server = tf.train.Server(
         cluster, job_name=FLAGS.job_name, task_index=FLAGS.task_index)
-    # 如果当前节点是parameter server，则不再进行后续的操作，而是使用server.join等待worker工作
+    # 如果当前节点是parameter server，则不再进行后续的操作，
+    # 而是使用server.join等待worker工作
     if FLAGS.job_name == "ps":
         server.join()
 
     is_chief = (FLAGS.task_index == 0)
+
+    # 删除之前的训练记录
+    if tf.gfile.Exists(FLAGS.train_dir) and is_chief:
+        tf.gfile.DeleteRecursively(FLAGS.train_dir)
+    tf.gfile.MakeDirs(FLAGS.train_dir)
 
     if FLAGS.num_gpus > 0:
         # 避免gpu分配冲突：现在为相应机器中的每个worker分配task_num - > #gpu
@@ -125,8 +119,8 @@ def train():
                 ps_device='/job:ps/cpu:0',
                 cluster=cluster)
     with tf.device(device_setter):
-        global_step = tf.train.get_or_create_global_step()
-       # global_step = tf.Variable(0, name="global_step", trainable=False)
+        global_step = tf.Variable(0, trainable=False, name='global_step')
+
         # Get images and labels for CIFAR-10.
         images, labels = cifar10.distorted_inputs()
 
@@ -145,8 +139,10 @@ def train():
                                         decay_steps,
                                         LEARNING_RATE_DECAY_FACTOR,
                                         staircase=True)
-        # 创建同步训练的优化器，tf.train.SyncReplicasOptimizer实质上是对原有优化器的一个扩展，
-        # 我们传入原有优化器及其他参数，它会将原有优化器改造为同步分布式训练版本
+        # 创建同步训练的优化器
+        # tf.train.SyncReplicasOptimizer实质上是对原有优化器的一个扩展，
+        # 我们传入原有优化器及其他参数，
+        # 它会将原有优化器改造为同步分布式训练版本
         opt = tf.train.SyncReplicasOptimizer(
             tf.train.GradientDescentOptimizer(lr),
             replicas_to_aggregate=num_workers,
@@ -185,13 +181,20 @@ def train():
                                   'sec/batch)')
                     print(format_str % (datetime.now(), self._step, loss_value,
                                         examples_per_sec, sec_per_batch))
-        hooks = [tf.train.StopAtStepHook(last_step=FLAGS.max_steps),
+        hooks = [opt.make_session_run_hook(is_chief),
+                 tf.train.StopAtStepHook(last_step=FLAGS.max_steps),
                  tf.train.NanTensorHook(loss),
                  _LoggerHook()]
 
         sess_config = tf.ConfigProto(
-            allow_soft_placement=True,  # 软放置 如果该操作函数没有 GPU 实现时，会本动使用 CPU 设备
-            log_device_placement=True,  # 是否打印操作所对应的执行设备的信息
+            # 软放置
+            # 如果该操作函数没有 GPU 实现时
+            # 会自动使用 CPU 设备
+            allow_soft_placement=True,
+            # 是否打印操作所对应的执行设备的信息
+            log_device_placement=False,
+            # device_filters:硬件过滤器
+            # 如果被设置的话，会话会忽略掉所有不匹配过滤器的硬件。
             device_filters=["/job:ps",
                             "/job:worker/task:%d" % FLAGS.task_index])
 
