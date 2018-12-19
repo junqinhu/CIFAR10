@@ -126,7 +126,7 @@ def _variable_with_weight_decay(name, shape, stddev, wd):
     return var
 
 
-def distorted_inputs():
+def distorted_inputs(batch_size):
     """Construct distorted input for CIFAR training using the Reader ops.
     Returns:
       images: Images. 4D tensor of [batch_size, IMAGE_SIZE, IMAGE_SIZE, 3] size.
@@ -138,7 +138,7 @@ def distorted_inputs():
         raise ValueError('Please supply a data_dir')
     data_dir = os.path.join(FLAGS.data_dir, 'cifar-10-batches-bin')
     images, labels = cifar10_input.distorted_inputs(data_dir=data_dir,
-                                                    batch_size=FLAGS.batch_size)
+                                                    batch_size=batch_size)
     if FLAGS.use_fp16:
         images = tf.cast(images, tf.float16)
         labels = tf.cast(labels, tf.float16)

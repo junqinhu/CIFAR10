@@ -6,14 +6,11 @@ Please use the following command to run the code:
     terminal 1： python cifar10_distribute_Train.py --job_name=ps --task_index=0
     terminal 2： python cifar10_distribute_Train.py --job_name=worker --task_index=1
     terminal 3： python cifar10_distribute_Train.py --job_name=worker --task_index=0
-
 """
 from __future__ import absolute_import
 from __future__ import division
 from __future__ import print_function
 
-import os
-import numpy as np
 from datetime import datetime
 import time
 
@@ -21,24 +18,31 @@ import tensorflow as tf
 
 import cifar10
 import cifar10_input
-
+import numpy as np
 FLAGS = tf.app.flags.FLAGS
 
 tf.app.flags.DEFINE_string('train_dir', '/tmp/cifar10_distribute_train',
                            """Directory where to write event logs """
                            """and checkpoint.""")
+tf.app.flags.DEFINE_string('config_dir', '/tmp/config.txt',
+                           """Directory where to read the config file """)
 tf.app.flags.DEFINE_integer('max_steps', 1000,
                             """Number of batches to run.""")
+tf.app.flags.DEFINE_integer('num_steps', 10,
+                            """Number of steps to run.""")
 tf.app.flags.DEFINE_integer('log_frequency', 10,
                             """How often to log results to the console.""")
 
 # 定义分布式参数
 # 参数服务器parameter server节点
-tf.app.flags.DEFINE_string('ps_hosts', 'localhost:2221',
+tf.app.flags.DEFINE_string('ps_hosts', '192.168.199.117:2221',
                            'Comma-separated list of hostname:port pairs')
 # 两个worker节点
-tf.app.flags.DEFINE_string('worker_hosts', 'localhost:2222,localhost:2223',
+tf.app.flags.DEFINE_string('worker_hosts', '192.168.199.117:2222,192.168.199.117:2223',
                     'Comma-separated list of hostname:port pairs')
+# 每次工作的节点数
+tf.app.flags.DEFINE_integer("replicas_to_aggregate", 0, "Total number of workers for each step.")
+
 # 每台机器的 GPU 个数
 tf.app.flags.DEFINE_integer("num_gpus", 0, "Total number of gpus for each machine."
                                            "If you don't use GPU, please set it to '0'")
@@ -60,7 +64,6 @@ MOVING_AVERAGE_DECAY = 0.9999  # The decay to use for the moving average.
 NUM_EPOCHS_PER_DECAY = 350.0  # Epochs after which learning rate decays.
 LEARNING_RATE_DECAY_FACTOR = 0.1  # Learning rate decay factor.
 INITIAL_LEARNING_RATE = 0.1  # Initial learning rate.
-
 
 def train():
     """Train CIFAR-10 for a number of steps."""
@@ -93,12 +96,20 @@ def train():
     if FLAGS.job_name == "ps":
         server.join()
 
-    is_chief = (FLAGS.task_index == 0)
+    # 从配置文件中读取配置内容，并以字典形式存储
+    # 配置信息为每个节点每批次训练的数据量
+    # 格式为{‘workerX：batch_size’}
+    f = open(FLAGS.config_dir)
+    dic_config = eval(f.read())
+    FLAGS.replicas_to_aggregate = len(dic_config)
+    dic_key = FLAGS.job_name + str(FLAGS.task_index)
+    if (dic_key in dic_config):
+        FLAGS.batch_size = dic_config[dic_key]
+    # 如果batch_size为0，则此节点不工作
+    if (FLAGS.batch_size == 0):
+        server.join()
 
-    # 删除之前的训练记录
-    if tf.gfile.Exists(FLAGS.train_dir) and is_chief:
-        tf.gfile.DeleteRecursively(FLAGS.train_dir)
-    tf.gfile.MakeDirs(FLAGS.train_dir)
+    is_chief = (FLAGS.task_index == 0)
 
     if FLAGS.num_gpus > 0:
         # 避免gpu分配冲突：现在为相应机器中的每个worker分配task_num - > #gpu
@@ -122,7 +133,8 @@ def train():
         global_step = tf.Variable(0, trainable=False, name='global_step')
 
         # Get images and labels for CIFAR-10.
-        images, labels = cifar10.distorted_inputs()
+
+        images, labels = cifar10.distorted_inputs(FLAGS.batch_size)
 
         # Build a Graph that computes the logits predictions from the
         # inference model.
@@ -145,7 +157,7 @@ def train():
         # 它会将原有优化器改造为同步分布式训练版本
         opt = tf.train.SyncReplicasOptimizer(
             tf.train.GradientDescentOptimizer(lr),
-            replicas_to_aggregate=num_workers,
+            replicas_to_aggregate=FLAGS.replicas_to_aggregate,
             total_num_replicas=num_workers)
         # 记得传入global_step以同步
         train_op = opt.minimize(loss, global_step=global_step)
@@ -160,11 +172,12 @@ def train():
         class _LoggerHook(tf.train.SessionRunHook):
             """Logs loss and runtime."""
             def begin(self):
-                self._step = -1
+                self._step = 0
                 self._start_time = time.time()
 
             def before_run(self, run_context):
                 self._step += 1
+                FLAGS.batch_size=120
                 return tf.train.SessionRunArgs(loss)  # Asks for loss value.
 
             def after_run(self, run_context, run_values):
@@ -181,8 +194,9 @@ def train():
                                   'sec/batch)')
                     print(format_str % (datetime.now(), self._step, loss_value,
                                         examples_per_sec, sec_per_batch))
+
         hooks = [opt.make_session_run_hook(is_chief),
-                 tf.train.StopAtStepHook(last_step=FLAGS.max_steps),
+                 tf.train.StopAtStepHook(num_steps=FLAGS.num_steps),
                  tf.train.NanTensorHook(loss),
                  _LoggerHook()]
 
