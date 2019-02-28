@@ -31,7 +31,7 @@ IMAGE_SIZE = 24
 
 # Global constants describing the CIFAR-10 data set.
 NUM_CLASSES = 10
-NUM_EXAMPLES_PER_EPOCH_FOR_TRAIN = 50000
+NUM_EXAMPLES_PER_EPOCH_FOR_TRAIN = 5000
 NUM_EXAMPLES_PER_EPOCH_FOR_EVAL = 10000
 
 
@@ -142,8 +142,13 @@ def distorted_inputs(data_dir, batch_size):
       images: Images. 4D tensor of [batch_size, IMAGE_SIZE, IMAGE_SIZE, 3] size.
       labels: Labels. 1D tensor of [batch_size] size.
     """
-    filenames = [os.path.join(data_dir, 'data_batch_%d.bin' % i)
-                 for i in xrange(1, 6)]
+    for root, dirs, files in os.walk(data_dir):
+        print(files)  # 当前路径下所有非目录子文件
+
+    filenames = [os.path.join(data_dir, files[i])
+                 for i in range(0, len(files))]
+
+    print(filenames)
     for f in filenames:
         if not tf.gfile.Exists(f):
             raise ValueError('Failed to find file: ' + f)
